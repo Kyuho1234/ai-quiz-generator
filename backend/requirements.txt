@@ -1,0 +1,16 @@
+# Web Framework
+fastapi==0.103.2
+uvicorn==0.27.1
+python-multipart==0.0.9
+
+# AI/ML
+google-generativeai==0.3.2
+sentence-transformers==2.6.0
+torch==2.2.2
+
+# PDF Processing
+PyPDF2==3.0.1
+
+# Utils
+python-dotenv==1.0.1
+requests==2.32.2 
