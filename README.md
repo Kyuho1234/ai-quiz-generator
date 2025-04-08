@@ -28,7 +28,6 @@ PDF 문서를 기반으로 AI가 자동으로 문제를 생성하고 학습을 �
 
 - Node.js 18.0.0 이상
 - Python 3.8 이상
-- Google Cloud API 키
 
 ### 설치 방법
 
