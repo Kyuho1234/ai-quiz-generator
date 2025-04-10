@@ -8,6 +8,7 @@ import os
 from dotenv import load_dotenv
 from typing import List, Dict
 import json
+import re
 
 load_dotenv()
 
@@ -44,51 +45,240 @@ def extract_text_from_pdf(file: UploadFile) -> str:
     # 텍스트 전처리
     return preprocess_text(text)
 
+def verify_semantic_consistency(question: Dict, context: str) -> Dict:
+    prompt = (
+        "다음 문서와 생성된 문제의 의미론적 일관성을 검증해주세요.\n\n"
+        f"문서: {context}\n\n"
+        f"문제: {question['question']}\n"
+        f"답변: {question['correct_answer']}\n"
+        f"해설: {question['explanation']}\n\n"
+        "다음 기준으로 평가해주세요 (각 항목 0-1점):\n"
+        "1. 문제가 문서의 핵심 내용을 다루고 있는가?\n"
+        "2. 답변이 문서의 내용과 일치하는가?\n"
+        "3. 해설이 문서의 내용을 정확히 반영하는가?\n"
+        "4. 문제의 난이도가 적절한가?\n"
+        "5. 문제가 오해의 소지 없이 명확한가?\n\n"
+        "각 항목에 대해 0에서 1 사이의 점수를 매기고, 종합적인 피드백을 제공해주세요.\n"
+        "다음 항목들에 대해 0과 1 사이의 점수를 매겨주세요:\n"
+        "- content_relevance (문제가 문서의 핵심 내용을 다루는 정도)\n"
+        "- answer_accuracy (답변이 문서의 내용과 일치하는 정도)\n"
+        "- explanation_accuracy (해설이 문서의 내용을 정확히 반영하는 정도)\n"
+        "- difficulty_appropriateness (문제 난이도의 적절성)\n"
+        "- clarity (문제의 명확성)\n\n"
+        "또한 전반적인 피드백도 함께 제공해주세요."
+    )
+    
+    try:
+        response = model.generate_content(prompt)
+        response_text = response.text.strip()
+        
+        # 응답에서 점수와 피드백 추출
+        scores = {}
+        feedback = ""
+        
+        # 점수 추출을 위한 키워드
+        score_keywords = {
+            "content_relevance": ["content_relevance", "문서 관련성", "핵심 내용"],
+            "answer_accuracy": ["answer_accuracy", "답변 정확성", "답변 일치"],
+            "explanation_accuracy": ["explanation_accuracy", "해설 정확성", "해설 일치"],
+            "difficulty_appropriateness": ["difficulty_appropriateness", "난이도 적절성", "난이도"],
+            "clarity": ["clarity", "명확성", "문제 명확성"]
+        }
+        
+        # 각 점수 항목에 대해 값 추출
+        for score_key, keywords in score_keywords.items():
+            score = 0.5  # 기본값
+            for keyword in keywords:
+                for line in response_text.split('\n'):
+                    if any(keyword in line.lower() for keyword in keywords):
+                        # 숫자 추출 시도
+                        import re
+                        numbers = re.findall(r'0\.\d+|\d+\.?\d*', line)
+                        if numbers:
+                            try:
+                                score = float(numbers[0])
+                                if 0 <= score <= 1:  # 유효한 범위인지 확인
+                                    break
+                            except ValueError:
+                                continue
+            scores[score_key] = score
+        
+        # 피드백 추출
+        feedback_markers = ["피드백", "종합", "평가", "의견"]
+        for line in response_text.split('\n'):
+            if any(marker in line for marker in feedback_markers) and len(line) > 10:
+                feedback = line.strip()
+                break
+        
+        if not feedback:  # 피드백을 찾지 못한 경우
+            feedback = "자동 생성된 기본 피드백입니다."
+        
+        # 의미론적 일관성 점수 로깅
+        print(f"\n[의미론적 일관성 점수]")
+        print(f"문제: {question['question']}")
+        print("개별 점수:")
+        for key, score in scores.items():
+            print(f"- {key}: {score}")
+        print(f"평균 점수: {sum(scores.values()) / len(scores)}")
+        print("-" * 80)
+        
+        return {
+            'score': sum(scores.values()) / len(scores),
+            'details': {
+                'scores': scores,
+                'feedback': feedback
+            }
+        }
+    except Exception as e:
+        print(f"의미론적 일관성 검증 중 오류: {str(e)}")
+        return {
+            'score': 0.5,
+            'details': {
+                'scores': {
+                    'content_relevance': 0.5,
+                    'answer_accuracy': 0.5,
+                    'explanation_accuracy': 0.5,
+                    'difficulty_appropriateness': 0.5,
+                    'clarity': 0.5
+                },
+                'feedback': '검증 중 오류 발생'
+            }
+        }
+
+def extract_evidence(question: Dict, context: str) -> Dict:
+    prompt = (
+        "다음 문제의 답변과 해설이 문서의 어느 부분에 근거하는지 찾아주세요:\n\n"
+        f"문서: {context}\n"
+        f"문제: {question['question']}\n"
+        f"답변: {question['correct_answer']}\n"
+        f"해설: {question['explanation']}\n\n"
+        "다음 정보를 제공해주세요:\n"
+        "1. 문서에서 찾은 근거가 되는 텍스트를 정확히 인용해주세요.\n"
+        "2. 근거의 신뢰도를 0에서 1 사이의 점수로 평가해주세요.\n"
+        "3. 근거와 문제/답변/해설 간의 관계를 설명해주세요."
+    )
+    
+    try:
+        response = model.generate_content(prompt)
+        response_text = response.text.strip()
+        
+        # 응답에서 필요한 정보 추출
+        evidence_text = ""
+        confidence_score = 0.5
+        explanation = ""
+        
+        lines = response_text.split('\n')
+        for line in lines:
+            # 근거 텍스트 추출
+            if "근거" in line or "인용" in line:
+                evidence_text = line.split(":", 1)[1].strip() if ":" in line else line.strip()
+            
+            # 신뢰도 점수 추출
+            if "신뢰도" in line or "점수" in line:
+                import re
+                numbers = re.findall(r'0\.\d+|\d+\.?\d*', line)
+                if numbers:
+                    try:
+                        score = float(numbers[0])
+                        if 0 <= score <= 1:
+                            confidence_score = score
+                    except ValueError:
+                        pass
+            
+            # 설명 추출
+            if "관계" in line or "설명" in line:
+                explanation = line.split(":", 1)[1].strip() if ":" in line else line.strip()
+        
+        # 신뢰도 점수 로깅
+        print(f"\n[근거 추출 신뢰도]")
+        print(f"문제: {question['question']}")
+        print(f"신뢰도 점수: {confidence_score}")
+        print(f"근거: {evidence_text[:100]}..." if len(evidence_text) > 100 else evidence_text)
+        print("-" * 80)
+        
+        return {
+            'evidence_found': bool(evidence_text),
+            'evidence_text': evidence_text or "근거를 찾을 수 없습니다.",
+            'confidence_score': confidence_score,
+            'explanation': explanation or "관계 설명을 생성할 수 없습니다."
+        }
+    except Exception as e:
+        print(f"근거 추출 중 오류: {str(e)}")
+        return {
+            'evidence_found': True,
+            'evidence_text': '',
+            'confidence_score': 0.5,
+            'explanation': '근거 추출 중 오류 발생'
+        }
+
 def verify_question_with_rag(question: Dict, context: str) -> Dict:
     try:
-        # 문서 임베딩
+        # 1. 기존 임베딩 기반 유사도 계산
         doc_embedding = rag_model.encode(context, convert_to_tensor=True)
         
-        # 질문과 정답 임베딩을 위한 텍스트 전처리
         question_text = preprocess_text(question["question"])
         answer_text = preprocess_text(question["correct_answer"])
         explanation_text = preprocess_text(question["explanation"])
         
-        # 질문, 정답, 해설을 각각 임베딩
         q_embedding = rag_model.encode(question_text, convert_to_tensor=True)
         a_embedding = rag_model.encode(answer_text, convert_to_tensor=True)
         e_embedding = rag_model.encode(explanation_text, convert_to_tensor=True)
         
-        # 각각의 유사도 계산
         q_similarity = torch.cosine_similarity(doc_embedding.unsqueeze(0), q_embedding.unsqueeze(0)).item()
         a_similarity = torch.cosine_similarity(doc_embedding.unsqueeze(0), a_embedding.unsqueeze(0)).item()
         e_similarity = torch.cosine_similarity(doc_embedding.unsqueeze(0), e_embedding.unsqueeze(0)).item()
         
-        # 디버깅을 위한 유사도 출력
-        print(f"\n질문: {question_text}")
-        print(f"질문 유사도: {q_similarity:.4f}")
-        print(f"답변 유사도: {a_similarity:.4f}")
-        print(f"해설 유사도: {e_similarity:.4f}")
-        
         # 평균 유사도 계산
         avg_similarity = (q_similarity + a_similarity + e_similarity) / 3
-        print(f"평균 유사도: {avg_similarity:.4f}")
         
-        # 유사도 임계값을 0.2로 낮춤
-        is_relevant = avg_similarity > 0.2
+        # 2. 의미론적 일관성 검증
+        semantic_result = verify_semantic_consistency(question, context)
+        
+        # 3. 근거 추출 및 신뢰도 평가
+        evidence_result = extract_evidence(question, context)
+        
+        # 종합적인 검증 결과 계산
+        # 임베딩 유사도(0.4), 의미론적 일관성(0.3), 근거 신뢰도(0.3) 가중치 적용
+        final_score = (
+            0.4 * avg_similarity +
+            0.3 * semantic_result['score'] +
+            0.3 * evidence_result['confidence_score']
+        )
+        
+        # 임계값을 0.2로 설정 (필요에 따라 조정 가능)
+        is_valid = final_score > 0.2
+        
+        print(f"\n[종합 검증 결과]")
+        print(f"문제: {question['question']}")
+        print(f"임베딩 유사도: {avg_similarity:.3f}")
+        print(f"의미론적 일관성: {semantic_result['score']:.3f}")
+        print(f"근거 신뢰도: {evidence_result['confidence_score']:.3f}")
+        print(f"최종 점수: {final_score:.3f}")
+        print("-" * 80)
         
         return {
-            "is_relevant": is_relevant,
-            "confidence": avg_similarity,
-            "question": question
+            "is_relevant": is_valid,
+            "question": question,
+            "scores": {
+                "embedding_similarity": avg_similarity,
+                "semantic_consistency": semantic_result['score'],
+                "evidence_confidence": evidence_result['confidence_score'],
+                "final_score": final_score
+            }
         }
+        
     except Exception as e:
-        print(f"RAG 검증 중 오류 발생: {str(e)}")
+        print(f"검증 중 오류 발생: {str(e)}")
         # 오류 발생 시 기본적으로 문제를 수용
         return {
             "is_relevant": True,
-            "confidence": 0.0,
-            "question": question
+            "question": question,
+            "scores": {
+                "embedding_similarity": 0.5,
+                "semantic_consistency": 0.5,
+                "evidence_confidence": 0.5,
+                "final_score": 0.5
+            }
         }
 
 def clean_json_string(json_str: str) -> str:
@@ -265,8 +455,7 @@ async def upload_pdf(file: UploadFile = File(...)):
 @app.post("/api/check-answers")
 async def check_answers(data: Dict):
     try:
-        answers = data["answers"]  # [{"question": str, "user_answer": str, "correct_answer": str, "question_type": str}]
-        
+        answers = data["answers"]
         results = []
         total_score = 0
         total_questions = len(answers)
@@ -274,12 +463,35 @@ async def check_answers(data: Dict):
         for answer in answers:
             try:
                 question = answer["question"]
-                user_answer = answer["user_answer"]
-                correct_answer = answer["correct_answer"]
+                user_answer = answer["user_answer"].strip()
+                correct_answer = answer["correct_answer"].strip()
                 question_type = answer.get("question_type", "unknown")
                 
-                # 정답 여부 확인
-                is_correct = user_answer.strip().lower() == correct_answer.strip().lower()
+                # 정답 처리를 위한 전처리
+                def normalize_answer(ans: str) -> str:
+                    # 소문자 변환
+                    ans = ans.lower()
+                    # 괄호와 그 안의 내용 제거 (선택적 내용으로 처리)
+                    ans = re.sub(r'\s*\([^)]*\)', '', ans)
+                    # 연속된 공백을 하나로
+                    ans = ' '.join(ans.split())
+                    # 특수문자 제거
+                    ans = re.sub(r'[.,!?;:]', '', ans)
+                    return ans
+                
+                # 정답 여부 확인 (좀 더 유연한 비교)
+                normalized_user_answer = normalize_answer(user_answer)
+                normalized_correct_answer = normalize_answer(correct_answer)
+                
+                # 기본 일치 여부 확인
+                is_correct = normalized_user_answer == normalized_correct_answer
+                
+                # 부분 점수 처리 (예: 객관식 문제에서 보기 번호만 다른 경우)
+                if not is_correct and question_type == "multiple_choice":
+                    # 보기 번호와 답안 내용을 분리하여 비교
+                    user_content = re.sub(r'^\d+\.\s*', '', normalized_user_answer)
+                    correct_content = re.sub(r'^\d+\.\s*', '', normalized_correct_answer)
+                    is_correct = user_content == correct_content
                 
                 # Gemini를 통한 개별 피드백 생성
                 feedback_prompt = f"""
@@ -290,12 +502,13 @@ async def check_answers(data: Dict):
                 정답: {correct_answer}
                 정답 여부: {'정답' if is_correct else '오답'}
                 
-                피드백은 다음 형식으로 작성해주세요:
-                1. 답변이 정답인 경우: 왜 정답인지 설명
-                2. 답변이 오답인 경우: 오답인 이유와 정답 설명
-                3. 추가 학습이 필요한 부분 제안
+                피드백 작성 시 다음 사항을 고려해주세요:
+                1. 답변이 정답인 경우: 간단한 설명만 제공
+                2. 답변이 오답인 경우: 핵심적인 차이점만 설명
+                3. 괄호 안의 추가 정보(영문/라틴어 표기 등)는 부가적인 것으로 간주
+                4. 표현이나 형식이 조금 다르더라도 핵심 내용이 같다면 정답으로 인정
                 
-                200자 이내로 작성해주세요.
+                100자 이내로 간단히 작성해주세요.
                 """
                 
                 try:
@@ -303,7 +516,7 @@ async def check_answers(data: Dict):
                     feedback_text = feedback_response.text.strip()
                 except Exception as e:
                     print(f"피드백 생성 중 오류 발생: {str(e)}")
-                    feedback_text = "피드백을 생성하는 중 오류가 발생했습니다."
+                    feedback_text = "정답 여부만 확인되었습니다."
                 
                 results.append({
                     "question": question,
@@ -320,7 +533,7 @@ async def check_answers(data: Dict):
                 print(f"개별 답안 처리 중 오류 발생: {str(e)}")
                 continue
         
-        # 종합 평가 생성
+        # 나머지 코드는 동일하게 유지
         score_percentage = (total_score / total_questions) * 100 if total_questions > 0 else 0
         
         try:
